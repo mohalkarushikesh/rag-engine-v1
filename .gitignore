@@ -8,3 +8,5 @@ __pycache__/
 #     so committing it lets OCR never re-run on any machine or CI.
 .rag_cache/*/
 !.rag_cache/text_*.json
+
+.venv/
