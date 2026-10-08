@@ -9,4 +9,5 @@ __pycache__/
 .rag_cache/*/
 !.rag_cache/text_*.json
 
+# don't remove this
 .venv/
