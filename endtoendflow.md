@@ -1,427 +1,248 @@
-The repository is TaxPilot, a Python multi-agent tax-preparation copilot for Indian income tax returns. Its core design is: LLMs read and explain documents; a deterministic Python engine computes the actual rupee values and attaches the rule behind each figure; the LangGraph pipeline pauses for human review when audited thresholds or unresolved facts need attention. The entrypoint is the FastAPI app in `src/taxpilot/api/main.py`, which serves the static web UI in `web/` and exposes the JSON API.
+# RAG-app — End-to-End Flow
 
-The real execution path is:
+A Retrieval-Augmented Generation app that ingests PDFs and answers questions grounded in their passages. **One codebase runs two ways**, chosen at runtime by the `RAG_BACKEND` environment variable:
 
-1. HTTP request enters FastAPI.
-2. `pipeline.prepare()` builds a LangGraph workflow and runs it.
-3. Document ingestion loads files from disk or inline payloads.
-4. Each document is classified, extracted, normalized, and fed into a `TaxState`.
-5. The graph does:
-   - intake guardrail
-   - extraction
-   - classification
-   - deduction research via BM25 knowledge retrieval
-   - deterministic tax computation
-   - audit scoring
-   - optional human review interrupt
-   - report generation
-   - guardrails
-   - finalization
-6. The API returns a `ReturnResponse` with the final tax return, report, citations, audit, guardrail results, and review metadata.
+- **`local`** (default) — fully offline, HuggingFace models, extractive answering. No cloud, no API keys.
+- **`bedrock`** — AWS-native, Amazon Bedrock embeddings + Claude generation. Deployed on App Runner.
 
-Start-to-finish file and code map
+Everything except two swap points — the **embedding model** and the **answerer** — is shared between the two backends. PDF extraction/OCR, chunking, FAISS indexing, hybrid retrieval, caching, the Flask API, and the UI are identical regardless of backend.
 
-- `pyproject.toml`
-  - Declares the project as `taxpilot`
-  - Scripts:
-    - `tax-ingest = "taxpilot.knowledge.ingest:main"`
-    - `tax-api = "taxpilot.api.main:run"`
-  - Dependencies:
-    - `langgraph`
-    - `fastapi`
-    - `uvicorn`
-    - `anthropic`
-    - `pydantic`, `pydantic-settings`, `python-dotenv`
-    - optional OCR extras for PDFs/images
+---
 
-- `src/taxpilot/config.py`
-  - `Settings` reads `.env`
-  - Controls:
-    - `llm_provider` = `"anthropic"` or `"gemini"`
-    - `tax_year` = 2024
-    - `corpus_dir`, `documents_dir`
-    - review thresholds
-    - feature flags: `enable_rag`, `enable_audit`, `enable_review`, `enable_guardrails`
-  - `get_settings()` is a cached singleton configuration access point.
+## 1. High-Level Architecture
 
-- `src/taxpilot/models.py`
-  - This is the schema layer shared across the system.
-  - Key classes:
-    - `SourceDocument`
-    - `ExtractionResult`
-    - `ExtractedField`
-    - `TaxpayerProfile`
-    - `IncomeItem`
-    - `DeductionCandidate`
-    - `Citation`
-    - `TaxReturn`
-    - `AuditRisk`
-    - `ReviewItem`
-    - `Correction`
-    - `GuardrailOutcome`
-    - `TraceStep`
-    - `ReturnResponse`
-  - Important invariant: money is carried as integers in whole rupees; no LLM output is allowed to become an actual tax figure.
+```
+                         ┌─────────────────────────────────────────┐
+                         │              Flask web app               │
+                         │  app.py  (gunicorn in prod)              │
+                         │  GET /  /healthz  /api/status            │
+                         │  POST /api/ask                           │
+                         └───────────────┬─────────────────────────┘
+                                         │ builds once (daemon thread)
+                                         ▼
+                         ┌─────────────────────────────────────────┐
+                         │          build_pipeline()                │
+                         │          rag_pipeline.py                 │
+                         └───────────────┬─────────────────────────┘
+                                         │
+        ┌────────────────────────────────┼─────────────────────────────────┐
+        │ SHARED                          │ SHARED                          │
+        ▼                                 ▼                                 ▼
+  Extract text / OCR  ──►  Chunk (1000/200)  ──►  Embed + FAISS index  ──►  Hybrid Retriever
+  (pypdf + RapidOCR)       RecursiveCharacter       (cached on disk)        (semantic + keyword)
+                                                          │
+                              ┌───────────────────────────┴───────────────────────────┐
+                              │  SWAP POINT 1: load_embeddings()                        │
+                              │   local   → HuggingFaceEmbeddings(distilbert)           │
+                              │   bedrock → BedrockEmbeddings(titan-embed-v2)           │
+                              └─────────────────────────────────────────────────────────┘
+                                                          │
+                              ┌───────────────────────────┴───────────────────────────┐
+                              │  SWAP POINT 2: build_chain()  →  .invoke({"query"})     │
+                              │   local   → RetrieverReaderQA   (extractive reader)     │
+                              │   bedrock → BedrockGenerativeQA (Claude generates)      │
+                              └─────────────────────────────────────────────────────────┘
+```
 
-- `src/taxpilot/api/main.py`
-  - `PrepareRequest` and `ResumeRequest` define the API schema.
-  - `lifespan()` runs when the app starts:
-    - `get_settings()`
-    - `setup_logging()`
-    - `enable_system_trust_store()`
-    - `pipeline.get_graph()`
-  - App mounts the web UI at `/static` and serves `index.html` at `/`
-  - Routes:
-    - `GET /health`
-    - `POST /prepare`
-    - `GET /pending/{thread_id}`
-    - `POST /resume`
-  - `_inline_documents()` converts incoming JSON docs into `SourceDocument` entries.
+Both answerers expose the **same contract** — `.invoke({"query": q}) -> {"result": ...}` — so the Flask layer and the CLI never branch on backend.
 
-- `src/taxpilot/graph/pipeline.py`
-  - This is the public orchestration layer.
-  - `prepare(documents=None, documents_dir=None, thread_id=None, regime=None, use_llm=True)`
-    - If no docs passed, it resolves `documents_dir` from settings and calls `load_documents(directory)`.
-    - `graph = graph or get_graph()`
-    - `thread_id = thread_id or uuid.uuid4().hex`
-    - Runs:
-      - `graph.invoke(initial_state(documents, regime or "", use_llm), config=_config(thread_id))`
-    - Converts graph output to `ReturnResponse` via `_to_response(...)`
-  - `resume(thread_id, corrections=...)`
-    - Reads existing graph state using `graph.get_state(config)`
-    - Calls `graph.invoke(Command(resume=payload), config=config)`
-  - `pending_review(thread_id)`
-    - Inspects LangGraph interrupts and returns the review payload.
-  - `_to_response()` packages:
-    - `tax_return`
-    - `audit`
-    - `report`
-    - `guardrails`
-    - `awaiting_review`
-    - `review_items`
-    - `trace`
-    - token counts and latency
+---
 
-- `src/taxpilot/graph/builder.py`
-  - This compiles the actual workflow graph.
-  - `build_graph()` adds nodes:
-    - guardrail_intake
-    - extract
-    - classify
-    - research
-    - calculate
-    - summarize
-    - audit
-    - review_gate
-    - report
-    - guardrail_output
-    - finalize
-  - `after_intake(state)`:
-    - if `state["blocked"]`, route to `finalize`
-    - otherwise route to `extract`
-  - `after_review(state)`:
-    - if `state["recompute"]`, route back to `calculate`
-    - otherwise route to `report`
-  - `get_graph()` is the process-wide cached compiled graph.
-  - The graph uses `MemorySaver` with a custom `JsonPlusSerializer` so pydantic models survive a review resume.
+## 2. Component Map
 
-- `src/taxpilot/graph/state.py`
-  - Defines `TaxState` as a `TypedDict`.
-  - Fields are populated across the run:
-    - `documents`
-    - `extractions`
-    - `profile`
-    - `income`
-    - `regime_override`
-    - `use_llm`
-    - `deductions`
-    - `tax_return`
-    - `audit`
-    - `review_required`
-    - `classify_notes`
-    - `review_items`
-    - `reviewed`
-    - `corrections`
-    - `recompute`
-    - `report`
-    - `llm_summary`
-    - `guardrails`
-    - `blocked`
-    - `block_message`
-    - `trace`
-    - `input_tokens`
-    - `output_tokens`
-  - `initial_state(...)` seeds all empty lists and defaults.
+| File | Role |
+|---|---|
+| `rag_pipeline.py` | Core pipeline + CLI: extraction, OCR, chunking, embeddings, FAISS, hybrid retrieval, both answerers, backend selection. |
+| `app.py` | Flask server; builds the pipeline once in a background thread, serves UI + JSON API. |
+| `templates/index.html` | Single-page UI (status chip, question box, answer card). |
+| `static/js/app.js` | Polls `/api/status`, POSTs to `/api/ask`. |
+| `static/css/styles.css` | USWDS-styled layout. |
+| `.rag_cache/` | On-disk caches: extracted text (`text_<hash>.json`) + FAISS index (`<signature>/index.faiss`, `index.pkl`). |
+| `scripts/download_models.py` | Bakes local HF models into the Docker image at build time. |
+| `Dockerfile` | CPU-only image; offline models; gunicorn entrypoint. |
+| `infra/` | Terraform: ECR + App Runner + IAM (Bedrock least-privilege). |
+| `deploy.sh` | Build → push ECR → `terraform apply`. |
+| `.github/workflows/deploy.yml` | CI "Deploy RAG app to AWS". |
+| `.env.example`, `requirements.txt` | Runtime config + dependencies. |
 
-Exact execution sequence
+---
 
-1. App bootstrap
-   - `tax-api` entry runs `taxpilot.api.main:run()`
-   - `run()` starts uvicorn on the configured host/port.
-   - At startup, `lifespan()` compiles the graph as a one-time cost.
+## 3. Shared Pipeline (both backends)
 
-2. Prepare request
-   - Client POSTs to `/prepare`
-   - Request may contain:
-     - `documents` inline
-     - `documents_dir`
-     - `thread_id`
-     - `regime` override
-     - `use_llm`
-   - If `documents` is missing, the app loads files from `settings.documents_dir`.
+Orchestrated by `build_pipeline()` in `rag_pipeline.py`:
 
-3. Document ingestion
-   - `src/taxpilot/intake/loader.py`
-   - `load_documents(directory)`
-     - iterates directory entries
-     - calls `load_document(path)`
-     - `load_document()` calls `extract_text(path)` from `intake/ocr.py`
-   - `extract_text(path)`
-     - `.txt/.md/.json/.csv` -> read as plain text
-     - `.pdf` -> uses `pypdf` if installed
-     - images -> OCR via `pytesseract` + `PIL`
-     - raises `OcrUnavailableError` if OCR support is missing for scanned files
-   - `classify_doc_type(text, filename)`:
-     - checks a priority marker list like:
-       - “form 16”
-       - “form 26as”
-       - “80c”
-       - “interest certificate”
-       - “rent receipt”
-       - “home loan”
-     - returns a `DocType` enum
-   - Constructed object:
-     - `SourceDocument(id, filename, doc_type, text, ocr_confidence)`
-   - This yields a list of document objects as the first concrete data payload.
+1. **Extract text** — `extract_texts()`. Fast path: `pypdf.PdfReader.extract_text()`. If a page/file yields no text (scanned or outlined PDF), falls back to **OCR** via `ocr_pdf()`: PyMuPDF renders each page, `RapidOCR` (offline ONNX) reads it.
+2. **Cache extracted text** — `get_texts()` writes `.rag_cache/text_<hash>.json`, keyed on **PDF content hash** (`_files_signature`), so OCR runs exactly once and the sidecar is portable/commitable.
+3. **Chunk** — `split_into_chunks()`: each page becomes a LangChain `Document`, then `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)`.
+4. **Embed + index** — `build_vector_store()`: `FAISS.from_documents(documents, embedding_model)`.
+5. **Cache the FAISS index** — saved to `.rag_cache/<signature>/`; reloaded with `FAISS.load_local(...)`. The signature (`_source_signature`) includes the **effective embedding id** + chunk settings (`emb=...;chunk=1000/200`), so **local and Bedrock indexes never collide** — switching backends triggers a clean reindex.
 
-4. Initial graph state
-   - `initial_state(documents, regime_override, use_llm)` populates `TaxState`
-   - The graph is invoked with that state and a thread checkpoint config.
+### Hybrid retrieval (shared) — `HybridRetriever`
 
-5. Guardrail intake
-   - `guardrail_intake_node` in `src/taxpilot/graph/nodes.py`
-   - This calls the guardrail pipeline from `src/taxpilot/guardrails/pipeline.py`
-   - `Guardrails.check_documents(...)`
-     - rejects empty submissions
-     - rejects oversized document sets
-     - blocks text injection patterns
-     - inventories PII
-     - optionally calls LLM intake review to verify the submission is actually tax documents
-   - If blocked:
-     - `after_intake` routes to `finalize`
-     - the pipeline ends early.
+- **Semantic arm:** `vector_store.similarity_search(query, k=SEMANTIC_K)` over FAISS.
+- **Keyword arm:** content-word overlap — `_keywords()` lowercases/tokenizes, drops stopwords and 1-char tokens, scores chunks by keyword-intersection size. Added because weak local embeddings miss exact-term questions (e.g. "What is Acrophobia?").
+- `contexts()` unions both arms, de-duped by passage text.
+- Knobs: `RAG_SEMANTIC_K` (default 5), `RAG_KEYWORD_K` (default 5).
 
-6. Extraction
-   - `extract_node` in `graph/nodes.py`
-   - It uses the extractor in `src/taxpilot/extraction/extractor.py`
-   - `Extractor.extract(doc)`
-     - if LLM available: `_extract_llm(doc)`
-     - else: `_extract_heuristic(doc)`
-   - `_extract_llm()`
-     - builds a prompt with document type + text
-     - calls `self.llm.complete_json(...)`
-     - expects a JSON schema with `fields`
-     - canonicalizes each label with `canonicalize()`
-     - coerces numeric strings with `_coerce()`
-     - creates `ExtractedField(name, value, confidence, source_doc, box)`
-   - `_extract_heuristic()`
-     - scans each line with regex:
-       - `_LINE` matches `Label: value`
-       - `_NUMBER` detects money-like strings
-     - turns values into numeric floats where applicable, otherwise leaves them as text
-   - Output is an `ExtractionResult(doc_id, doc_type, fields)` stored in `state["extractions"]`
+---
 
-7. Classification
-   - `classify_node` in `graph/nodes.py`
-   - Uses the extraction results and documents to determine:
-     - age category
-     - residential status
-     - regime preference
-   - It fills `TaxpayerProfile`:
-     - `AgeCategory.BELOW_60`, `SENIOR`, `SUPER_SENIOR`
-     - `residential_status` = `resident` or `non_resident`
-     - `regime_preference` = `"auto"`, `"old"`, or `"new"`
-   - This classification can also emit `ReviewItem`s if the facts are ambiguous.
+## 4. Backend Selection
 
-8. Research / deduction proposal
-   - `research_node` in `graph/nodes.py`
-   - It integrates with:
-     - `src/taxpilot/knowledge/retriever.py`
-     - `src/taxpilot/knowledge/store.py`
-     - `src/taxpilot/knowledge/corpus_loader.py`
-   - `get_retriever()` builds a BM25 retriever over the corpus under `data/corpus/`
-   - `Retriever.retrieve_multi(queries)`:
-     - runs multiple queries against the BM25 store
-     - deduplicates by passage
-     - ranks by relevance
-     - returns `Passage` objects
-   - `format_context(passages)` prints numbered context blocks with `rule_ids` and the underlying text
-   - The model proposes deductions as `DeductionCandidate` entries:
-     - `name`
-     - `kind` (`CHAPTER_VIA`, `HOUSE_PROPERTY`, `SALARY_EXEMPTION`)
-     - `amount`
-     - `citation`
-     - `rationale`
-     - `confidence`
-     - `needs_review`
-     - `grounded`
-   - This is where the “grounding” concept is enforced:
-     - the rule must be present in the corpus
-     - the citation must resolve to a known rule
-     - the output guardrails later verify it
+Read once at import in `rag_pipeline.py`:
 
-9. Deterministic tax computation
-   - `calculate_node` in `graph/nodes.py`
-   - Calls `src/taxpilot/calc/engine.py`
-   - `compute(profile, income, deductions, tax_year=2024)`
-     - sums salary, interest, other income
-     - sums TDS
-     - computes both old and new regimes
-     - chooses:
-       - forced regime if `profile.regime_preference` is set
-       - otherwise the lower tax under “auto”
-   - Important helpers:
-     - `slab_tax()`
-     - `_slabs_for()`
-     - `_standard_deduction()`
-     - `_rebate_87a()`
-     - `_surcharge()`
-     - `_chapter_via()`
-     - `_house_property_loss()`
-   - `TaxReturn` is built by `_build_return(...)`
-   - Every tax line includes `TaxLine` objects with:
-     - `line`
-     - `label`
-     - `amount`
-     - `citation`
-   - Rule IDs come from `src/taxpilot/knowledge/rules.py` via `cite(rule_id)`
+```python
+RAG_BACKEND = os.environ.get("RAG_BACKEND", "local").strip().lower()
+```
 
-10. Summary phase
-   - `summarize_node` in `graph/nodes.py`
-   - Creates a human-readable summary of the computed return and the major deductions.
-   - This summary is useful both:
-     - while a review is pending
-     - after resuming and recomputing
+Only two functions branch on it:
 
-11. Audit scoring
-   - `audit_node` in `graph/nodes.py`
-   - Calls `src/taxpilot/audit/scorer.py`
-   - `score_return(tax_return, income, deductions, extractions)`:
-     - checks TDS vs Form 26AS
-     - checks deductions at or near cap
-     - checks large deduction ratios
-     - checks large donation claims
-     - checks review-needed deductions
-     - checks low-confidence extractions
-     - checks large refund relative to income
-   - Returns `AuditRisk(score, band, flags)` with weighted red flags.
-   - The audit score is a heuristic, not a trained model; it is transparent and explainable.
+| Swap point | `local` | `bedrock` |
+|---|---|---|
+| **Embeddings** — `load_embeddings()` | `HuggingFaceEmbeddings(model_name="distilbert-base-uncased")` | `BedrockEmbeddings(model_id=BEDROCK_EMBED_MODEL, region_name=BEDROCK_REGION)` (lazy `langchain_aws` import) |
+| **Answerer** — `build_chain()` | `RetrieverReaderQA`: hybrid retriever + `ExtractiveReader` (`deepset/roberta-base-squad2`), scores all passages in one batched forward pass, returns best answer span | `BedrockGenerativeQA`: hybrid retriever + `ChatBedrock`, stuffs passages into a grounded prompt, generates with `temperature=0, max_tokens=512` |
 
-12. Review gate
-   - `review_gate_node` in `graph/nodes.py`
-   - This is the human interrupt point.
-   - The gate raises `interrupt()` when:
-     - risk is above threshold
-     - refund or payable exceeds threshold
-     - confidence is low
-     - deductions need confirmation
-     - the return is out of scope for the deterministic engine path
-   - `pipeline.pending_review(thread_id)` fetches the review payload.
-   - This is the “pause and wait for human approval” loop.
+`clean()` also branches: local keeps the first paragraph; bedrock returns the full generated answer. The lazy AWS imports mean the offline path never needs `boto3`/`langchain-aws` installed at runtime.
 
-13. Human correction flow
-   - Client calls `GET /pending/{thread_id}` to inspect reasons.
-   - Client then calls `POST /resume` with `Correction` objects.
-   - `pipeline.resume()`:
-     - gets graph state for the thread
-     - sends `Command(resume={"corrections": [...]})`
-   - Builder routes via `after_review()`:
-     - if `recompute` was triggered, returns to `calculate`
-     - otherwise goes to `report`
+### Models
 
-14. Report generation
-   - `report_node` in `graph/nodes.py`
-   - Uses the computed `TaxReturn`, citations, and deductions to produce plain-language narrative.
-   - It writes `state["report"]`.
-   - The repo explicitly enforces the rule: “The LLM reads, retrieves, explains, and spots anomalies; the deterministic engine computes the numbers.”
+| | Local | Bedrock |
+|---|---|---|
+| Embeddings | `distilbert-base-uncased` (768-dim, mean-pooled) | `amazon.titan-embed-text-v2:0` |
+| Answerer | `deepset/roberta-base-squad2` (extractive QA) | `anthropic.claude-3-haiku-20240307-v1:0` (generative) |
+| OCR | RapidOCR (ONNX, offline) | RapidOCR (same) |
 
-15. Guardrail output
-   - `guardrail_output_node` in `graph/nodes.py`
-   - Calls `src/taxpilot/guardrails/pipeline.py`
-   - `Guardrails.check_output(report, tax_return, deductions, use_llm=True)`
-   - Layer sequence:
-     - `shape`
-     - `injection`
-     - `pii_inventory`
-     - `figure_integrity`
-     - `citation_grounding`
-     - `pii_redaction`
-     - `disclaimer`
-     - optional `output_review`
-   - The key invariant is `figure_integrity`:
-     - all rupee figures in the narrative must be drawn from:
-       - engine output
-       - published constants
-       - grounded deduction values
-     - if the report invents any `₹` values, it is rejected.
-   - PII redaction masks PAN/Aadhaar for display.
-   - A disclaimer is appended to mark it as a draft return.
+---
 
-16. Finalization
-   - `finalize_node` in `graph/nodes.py`
-   - It bundles the state into final structured output.
-   - `pipeline._to_response(...)` packages it into `ReturnResponse`.
-   - Response fields include:
-     - `tax_year`
-     - `regime`
-     - `tax_return`
-     - `audit`
-     - `report`
-     - `llm_summary`
-     - `used_llm`
-     - `citations`
-     - `awaiting_review`
-     - `review_items`
-     - `thread_id`
-     - `guardrails`
-     - `blocked`
-     - `block_message`
-     - `trace`
-     - token counts
-     - latency
+## 5. Request Flow (runtime)
 
-Database and LLM interaction map
+### Startup
 
-- No relational database is used in the app code path.
-- The only “state persistence” is:
-  - in-memory LangGraph checkpointer (`MemorySaver`) for the paused review thread
-  - BM25 in-memory knowledge store for the corpus
-- The actual external ML interaction is through:
-  - `src/taxpilot/llm/client.py`
-  - `LLMClient.complete()`
-  - `LLMClient.complete_json()`
-  - provider switch:
-    - Anthropic via `anthropic.Anthropic(...)`
-    - or Gemini via `get_llm()` selecting the Gemini client when configured
-- Structured model outputs are enforced by JSON-schema validation, so the extractor, classifier, researcher, and guardrails all expect strongly typed data.
-- If `use_llm=False` or no API key is configured, the system runs on deterministic paths only. The README explicitly says the suite and pipeline still work offline.
+`app.py` builds the pipeline **once** in a daemon thread via `start_build_once()` — triggered at module import so it runs under gunicorn too. State lives in a module-level `_state` dict (`status: loading|ready|error`, `message`, `backend`) guarded by `_lock`.
 
-What connects each component
+### API
 
-- `api/main.py` -> `graph/pipeline.py` -> `graph/builder.py` -> `graph/nodes.py`
-- `graph/nodes.py` -> `extraction/extractor.py` -> `models.py` -> `TaxState`
-- `graph/nodes.py` -> `knowledge/retriever.py` -> `knowledge/store.py` -> `data/corpus`
-- `graph/nodes.py` -> `calc/engine.py` -> `knowledge/rules.py` -> engine outputs
-- `graph/nodes.py` -> `audit/scorer.py` -> review gate
-- `graph/nodes.py` -> `guardrails/pipeline.py` -> final `ReturnResponse`
-- `api/main.py` returns the response to the UI or caller
+| Route | Method | Behavior |
+|---|---|---|
+| `/` | GET | Renders `index.html` with configured `pdf_paths`. |
+| `/healthz` | GET | Liveness probe; `{"ok": true}` 200 as soon as the web process is up (decoupled from index build — used by App Runner health check). |
+| `/api/status` | GET | `{status, message, backend}`. UI polls this every 1.5s. |
+| `/api/ask` | POST | Body `{"query": "..."}` → `{"answer": "..."}`. 503 if not ready, 400 if empty. |
 
-The exact final output contract is a `ReturnResponse` object, not a database row. The UI reads it and shows:
-- summary
-- report
-- sources
-- audit
-- guardrails
-- trace
+### Ask path (identical for both backends)
 
-The final artifact is an explainable draft tax return: numbers come from the deterministic engine, explanations and citations come from the retriever and LLM, and the output is checked by guardrails before being returned.
+```
+UI textarea → POST /api/ask {query}
+  → chain.invoke({"query": q})
+      → HybridRetriever.contexts(q)         # semantic + keyword, de-duped
+      → local:   ExtractiveReader picks best span across passages
+        bedrock: ChatBedrock generates grounded answer from passages
+      → clean(result)
+  → {"answer": ...} → rendered in answer card
+```
+
+---
+
+## 6. Running Locally (`RAG_BACKEND=local`, default)
+
+```bash
+pip install -r requirements.txt
+python app.py                      # http://127.0.0.1:5000
+```
+
+Custom documents:
+
+```bash
+RAG_PDF_PATHS="a.pdf,b.pdf" python app.py
+```
+
+- Runs **fully offline** — `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` are set at the top of `rag_pipeline.py` before transformers imports.
+- First build does extract → (OCR if needed) → chunk → embed → index. Subsequent startups reload the cache (~8s).
+- CLI alternatives:
+  ```bash
+  python rag_pipeline.py "your question"   # one-shot
+  python rag_pipeline.py                   # interactive REPL
+  python rag_pipeline.py extract           # run OCR once, populate text cache
+  ```
+
+### Testing the Bedrock path locally
+
+Needs AWS credentials (standard chain: `aws configure` / `AWS_PROFILE` / env keys) and Bedrock model access in the region:
+
+```bash
+RAG_BACKEND=bedrock AWS_REGION=us-east-1 python app.py
+```
+
+This reindexes with Titan embeddings (new cache signature) and answers via Claude Haiku.
+
+---
+
+## 7. Deploying to AWS (`RAG_BACKEND=bedrock`)
+
+### One command
+
+```bash
+AWS_REGION=us-east-1 IMAGE_TAG=$(git rev-parse --short HEAD) ./deploy.sh
+```
+
+`deploy.sh` runs:
+
+1. `terraform init` + targeted apply of the **ECR repo**.
+2. ECR docker login.
+3. Build image (bakes local HF models via `download_models.py` — needs internet, so run from CI/CodeBuild or an off-corp-network box), tag, push.
+4. `terraform apply` the **App Runner** service.
+5. Print `service_url` (public HTTPS).
+
+### What Terraform provisions (`infra/`)
+
+- **ECR** repo — scan-on-push, lifecycle keep-last-10, `force_delete`.
+- **Two IAM roles:**
+  - *Access role* (`build.apprunner.amazonaws.com`) — ECR pull.
+  - *Instance role* (`tasks.apprunner.amazonaws.com`) — **least-privilege Bedrock**: `bedrock:InvokeModel` + `bedrock:InvokeModelWithResponseStream` on `arn:aws:bedrock:*::foundation-model/*`. **No API keys stored** — the app calls Bedrock via this role.
+- **App Runner service** — injects env vars (`RAG_BACKEND=bedrock`, `AWS_REGION`, `RAG_BEDROCK_EMBED_MODEL`, `RAG_BEDROCK_CHAT_MODEL`, `RAG_PDF_PATHS`, `PORT=8080`), `/healthz` health check, autoscaling (min 1 / max 3 / max-concurrency 50), 1024 CPU / 3072 MB. Bedrock is a public API — no VPC connector needed.
+- Terraform defaults set `rag_backend=bedrock` for AWS (vs `local` default in code).
+
+### CI alternative
+
+The **"Deploy RAG app to AWS"** GitHub workflow (`.github/workflows/deploy.yml`) runs the same `deploy.sh` on manual dispatch or push to `main` (app/infra paths). Auth via OIDC (`AWS_ROLE_ARN`) or access-key secrets fallback; `IMAGE_TAG` = input or commit SHA.
+
+### Teardown
+
+```bash
+terraform -chdir=infra destroy
+```
+
+---
+
+## 8. Environment Variables
+
+| Var | Default | Applies to | Purpose |
+|---|---|---|---|
+| `RAG_BACKEND` | `local` | both | `local` or `bedrock`. |
+| `RAG_PDF_PATHS` | sample PDF | both | Comma-separated PDFs to ingest. |
+| `RAG_SEMANTIC_K` | `5` | both | Semantic retrieval depth. |
+| `RAG_KEYWORD_K` | `5` | both | Keyword-arm depth. |
+| `RAG_CACHE_DIR` | `.rag_cache` | both | Cache location. |
+| `RAG_QA_MODEL` | `deepset/roberta-base-squad2` | local | Extractive reader model. |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | bedrock | Bedrock region. |
+| `RAG_BEDROCK_EMBED_MODEL` | `amazon.titan-embed-text-v2:0` | bedrock | Embedding model id. |
+| `RAG_BEDROCK_CHAT_MODEL` | `anthropic.claude-3-haiku-20240307-v1:0` | bedrock | Chat model id. |
+| `HOST` / `PORT` | `127.0.0.1` / `5000` (`8080` in container) | both | Bind address. |
+
+---
+
+## 9. Backend Comparison at a Glance
+
+| Aspect | `local` | `bedrock` |
+|---|---|---|
+| Network | Fully offline | Calls AWS Bedrock |
+| Auth | None | IAM instance role (no keys) |
+| Embeddings | distilbert (HF) | Titan Embed v2 |
+| Answering | Extractive span (RoBERTa) | Generative (Claude Haiku) |
+| Answer style | Verbatim span from passage | Fluent grounded generation |
+| Cost | Compute only | Per-token Bedrock usage |
+| Deploy target | Laptop / any box | App Runner (HTTPS, autoscale) |
+| Cache signature | `emb=distilbert;...` | `emb=titan;...` (separate index) |
+
+---
+
+*Shared design insight: retrieval, extraction/OCR, chunking, and caching are backend-agnostic. Only `load_embeddings()` and `build_chain()` swap, both behind a common `.invoke({"query"}) → {"result"}` interface — so the API, UI, and CLI are written once and run unchanged on either backend.*
