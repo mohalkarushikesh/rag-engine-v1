@@ -193,3 +193,8 @@ outlines/curves. `pypdf` extracts nothing from those.
 See [Todo.md](Todo.md) — next up: multi-document retrieval and live source retrieval (showing which
 passages an answer came from). The per-file text cache already makes adding a document OCR only that
 new file.
+
+
+## Application 
+
+![RAG Web Application](/assets/rag-application.png)
